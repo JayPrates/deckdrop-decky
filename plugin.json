@@ -1,0 +1,11 @@
+{
+  "name": "DeckDrop",
+  "author": "JayPrates",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["files", "network", "utility"],
+    "description": "Receive files from your Windows PC over the local network. Every transfer asks for approval first.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
