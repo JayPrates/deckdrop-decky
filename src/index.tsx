@@ -24,8 +24,7 @@ type Item = { id: number; from: string; count: number; size: number; saved: numb
 type Settings = { enabled: boolean; notify: boolean };
 type State = {
   me: { name: string; ips: string[]; port: number };
-  folder: string;          // where files go, "~/..." form
-  folder_path: string;     // the same, as a full path (where the folder picker starts)
+  folder: string;          // where files go (full path)
   default_folder: string;
   peers: Peer[];
   offers: Offer[];
@@ -223,7 +222,7 @@ function Content() {
   const chooseFolder = async () => {
     let picked: { path: string; realpath: string };
     try {
-      picked = await openFilePicker(PICK_FOLDER, s.folder_path, false, true);
+      picked = await openFilePicker(PICK_FOLDER, s.folder, false, true);
     } catch {
       return;                        // closed without choosing
     }

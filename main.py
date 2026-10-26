@@ -81,28 +81,71 @@ def plural(n, word):
     return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
-def default_folder():
-    if os.environ.get("DECKDROP_FOLDER"):
-        return os.environ["DECKDROP_FOLDER"]
-    home = getattr(decky, "DECKY_USER_HOME", "") or os.path.expanduser("~")
-    return os.path.join(home, "Documents", FOLDER_NAME)
-
-
-def short_folder(path):
-    home = getattr(decky, "DECKY_USER_HOME", "") or os.path.expanduser("~")
-    return "~" + path[len(home):] if home and path.startswith(home + os.sep) else path
-
-
-def user_ids():
-    """(uid, gid) to give new files to when the backend runs as root, else None."""
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+def steam_uid():
+    """uid of the (non-root) user running Steam, i.e. the person using this machine, or None."""
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
         return None
+    for pid in pids:
+        try:
+            with open("/proc/%s/comm" % pid) as f:
+                if f.read().strip() not in ("steam", "steamwebhelper"):
+                    continue
+            uid = os.stat("/proc/" + pid).st_uid
+        except OSError:
+            continue
+        if uid != 0:
+            return uid
+    return None
+
+
+def find_user():
+    """(home, uid, gid, how) of the person files are for.
+
+    Decky may run the backend as root, and outside SteamOS its idea of "the user" (DECKY_USER / DECKY_USER_HOME) can
+    be root or a "deck" account that doesn't exist, so the owner of the Steam process wins. uid/gid are None when
+    unknown. how says where the answer came from; "fallback" ones are looked at again later (Steam may not be up yet).
+    """
     try:
         import pwd
-        pw = pwd.getpwnam(getattr(decky, "DECKY_USER", "") or "deck")
-        return pw.pw_uid, pw.pw_gid
-    except (ImportError, KeyError):
-        return None
+    except ImportError:                     # not Linux (tests)
+        return getattr(decky, "DECKY_USER_HOME", "") or os.path.expanduser("~"), None, None, "decky"
+    candidates = []
+    if os.geteuid() != 0:
+        candidates.append((os.geteuid(), "backend user"))
+    uid = steam_uid()
+    if uid is not None:
+        candidates.append((uid, "Steam's user"))
+    try:
+        candidates.append((pwd.getpwnam(getattr(decky, "DECKY_USER", "") or "deck").pw_uid, "fallback"))
+    except KeyError:
+        pass
+    for uid, how in candidates:
+        try:
+            pw = pwd.getpwuid(uid)
+        except KeyError:
+            continue
+        if uid != 0 and pw.pw_dir and pw.pw_dir != "/" and os.path.isdir(pw.pw_dir):
+            return pw.pw_dir, pw.pw_uid, pw.pw_gid, how
+    home = getattr(decky, "DECKY_USER_HOME", "") or os.path.expanduser("~")
+    return home, None, None, "fallback"
+
+
+def documents_dir(home):
+    """The desktop's Documents folder (localized names like ~/Documentos come from user-dirs.dirs), else ~/Documents."""
+    try:
+        with open(os.path.join(home, ".config", "user-dirs.dirs"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("XDG_DOCUMENTS_DIR="):
+                    value = line.split("=", 1)[1].strip().strip('"').replace("$HOME", home)
+                    # Set to $HOME itself means "no Documents folder".
+                    if os.path.isabs(value) and os.path.normpath(value) != os.path.normpath(home):
+                        return os.path.normpath(value)
+    except (OSError, UnicodeDecodeError):
+        pass
+    return os.path.join(home, "Documents")
 
 
 # ------------------------------------------------------------------ network helpers
@@ -209,7 +252,7 @@ class Plugin:
             self.settings["id"] = "%012x" % random.getrandbits(48)
             self._save_settings()
         self.name = device_name()
-        self.owner = user_ids()
+        self.user, self.user_checked = None, 0.0
         self.peers = {}
         self.offers = {}             # waiting for an answer: id -> offer
         self.transfers = {}          # accepted and arriving: id -> transfer
@@ -220,9 +263,11 @@ class Plugin:
         self.udp, self.server, self.tasks = None, None, []
         if self.settings["enabled"]:
             await self._start()
-        decky.logger.info("DeckDrop backend started as %s (%s), saving to %s%s", self.name,
-                          ", ".join(self.ips) or "no network", self.folder,
+        decky.logger.info("DeckDrop backend started as %s (%s), running as uid %s; Decky says the user is %s (home %s)%s",
+                          self.name, ", ".join(self.ips) or "no network", os.geteuid() if hasattr(os, "geteuid") else "?",
+                          getattr(decky, "DECKY_USER", "?"), getattr(decky, "DECKY_USER_HOME", "?"),
                           "" if self.settings["enabled"] else "; receiving is off")
+        decky.logger.info("saving to %s", self.folder)
 
     async def _unload(self):
         if getattr(self, "loop", None) is not None:
@@ -280,10 +325,25 @@ class Plugin:
         except OSError as e:
             decky.logger.warning("couldn't save settings: %s", e)
 
+    def _user(self):
+        """(home, uid, gid, how) of the person files are for; re-checked every few seconds until it's certain."""
+        if self.user is None or (self.user[3] == "fallback" and time.monotonic() - self.user_checked > 5):
+            found = find_user()
+            if found != self.user:
+                decky.logger.info("files are for uid %s, home %s (from %s)", found[1], found[0], found[3])
+            self.user, self.user_checked = found, time.monotonic()
+        return self.user
+
+    def _default_folder(self):
+        """DeckDrop inside the user's Documents folder."""
+        if os.environ.get("DECKDROP_FOLDER"):
+            return os.environ["DECKDROP_FOLDER"]
+        return os.path.join(documents_dir(self._user()[0]), FOLDER_NAME)
+
     @property
     def folder(self):
-        """Where accepted files are saved: the folder chosen in the panel, or ~/Documents/DeckDrop."""
-        return self.settings["folder"] or default_folder()
+        """Where accepted files are saved: the folder chosen in the panel, or Documents/DeckDrop."""
+        return self.settings["folder"] or self._default_folder()
 
     def _set_status(self, text, error=False):
         self.status, self.status_error = text, error
@@ -307,9 +367,11 @@ class Plugin:
         return self.peers[pid], known
 
     def _chown(self, path):
-        if self.owner is not None:
+        """Gives what a root backend creates to the user, so they can move and delete it."""
+        _, uid, gid, _ = self._user()
+        if uid is not None and hasattr(os, "geteuid") and os.geteuid() == 0:
             try:
-                os.chown(path, *self.owner)
+                os.chown(path, uid, gid)
             except OSError:
                 pass
 
@@ -432,7 +494,7 @@ class Plugin:
             free = (await self.loop.run_in_executor(None, shutil.disk_usage, folder)).free
         except OSError as e:
             await self._reply(writer, {"ok": False, "error": "the Deck can't write to %s (%s)" % (folder, e.strerror or e)})
-            self._record(offer, "failed", "Can't write to %s" % short_folder(folder))
+            self._record(offer, "failed", "Can't write to %s" % folder)
             return
         if total + SPARE_SPACE > free:
             await self._reply(writer, {"ok": False, "error": "not enough free space on the Deck (%s needed, %s free)"
@@ -477,7 +539,7 @@ class Plugin:
         t = {"id": offer["id"], "from": offer["from"], "count": offer["count"], "size": offer["size"],
              "received": 0, "index": 0, "current": "", "cancel": False, "started": time.monotonic()}
         self.transfers[t["id"]] = t
-        saved, status, message = 0, "done", ""
+        saved, status, message, paths = 0, "done", "", []
         run_io = lambda f, *a: self.loop.run_in_executor(None, f, *a)
         try:
             for i, (parts, size) in enumerate(files):
@@ -515,8 +577,10 @@ class Plugin:
                 os.rename(part, target)
                 self._chown(target)
                 saved += 1
+                if len(paths) < 5:
+                    paths.append(target)
             await self._reply(writer, {"ok": True, "done": True, "saved": saved})
-            message = "Saved to " + short_folder(offer["folder"])
+            message = "Saved to " + offer["folder"]
         except Cancelled:
             status, message = "cancelled", "Cancelled on the Deck"
             try:
@@ -542,16 +606,17 @@ class Plugin:
                 pass
         finally:
             self.transfers.pop(t["id"], None)
-        decky.logger.info("transfer %d: %s, %d of %d files saved (%s)", t["id"], status, saved, len(files), message)
+        decky.logger.info("transfer %d: %s, %d of %d files saved (%s)%s", t["id"], status, saved, len(files), message,
+                          "".join("\n    " + p for p in paths) + ("\n    ..." if saved > len(paths) else ""))
         self._record(offer, status, message, saved, t["received"])
         await self._emit("deckdrop_done", {"id": t["id"], "from": t["from"], "status": status, "message": message,
                                            "saved": saved, "count": t["count"], "size": t["size"],
-                                           "folder": short_folder(offer["folder"]), "notify": self.settings["notify"]})
+                                           "folder": offer["folder"], "notify": self.settings["notify"]})
 
     def _offer_view(self, offer):
         return {"id": offer["id"], "from": offer["from"], "count": offer["count"], "size": offer["size"],
                 "names": offer["names"], "folders": offer["folders"], "time": offer["time"],
-                "expires": offer["time"] + APPROVAL_TIMEOUT, "folder": short_folder(offer["folder"])}
+                "expires": offer["time"] + APPROVAL_TIMEOUT, "folder": offer["folder"]}
 
     # ---------- frontend API
 
@@ -561,9 +626,8 @@ class Plugin:
         peers = sorted(self.peers.values(), key=lambda p: p["name"].lower())
         return {
             "me": {"name": self.name, "ips": self.ips, "port": TCP_PORT},
-            "folder": short_folder(self.folder),
-            "folder_path": self.folder,
-            "default_folder": short_folder(default_folder()),
+            "folder": self.folder,
+            "default_folder": self._default_folder(),
             "peers": [{"id": p["id"], "name": p["name"], "kind": p["kind"], "ip": p["ip"]} for p in peers],
             "offers": [self._offer_view(o) for o in sorted(self.offers.values(), key=lambda o: o["id"])],
             "transfers": [{"id": t["id"], "from": t["from"], "count": t["count"], "size": t["size"],
@@ -608,12 +672,12 @@ class Plugin:
                 return {"ok": False, "message": "Can't use %s: %s" % (path, e.strerror or e)}
             if not os.access(path, os.W_OK):
                 return {"ok": False, "message": "DeckDrop isn't allowed to write to %s." % path}
-            if path == default_folder():
+            if path == self._default_folder():
                 path = ""
         self.settings["folder"] = path
         self._save_settings()
         decky.logger.info("saving files to %s", self.folder)
-        return {"ok": True, "message": "Files will be saved to %s." % short_folder(self.folder)}
+        return {"ok": True, "message": "Files will be saved to %s." % self.folder}
 
     async def set_setting(self, key, value):
         if key not in DEFAULTS or key in ("id", "folder"):
