@@ -14,6 +14,10 @@
 #     (the first one included) carries blocks: a 16-byte little-endian header (file index u32, offset u64, length u32)
 #     and that many bytes, in any order across connections, ending with a header whose index is 0xFFFFFFFF. Empty
 #     files are never sent; the Deck creates them. Several connections fill Wi-Fi better than one.
+#   - pause (v3): a parallel acceptance says "pause": true. The PC pauses by sending a header with index 0xFFFFFFFE and
+#     offset 1 on each connection, repeated every few seconds (so nothing times out), and offset 0 when it resumes.
+#     If the offer said "pause": true, the Deck can ask with {"type": "pause"}\n / {"type": "resume"}\n on the first
+#     connection.
 
 import asyncio
 import collections
@@ -48,6 +52,7 @@ MAX_STREAMS = 4                  # parallel connections per transfer
 MAX_BLOCK = 8 * 1024 * 1024
 BLOCK = struct.Struct("<IQI")    # file index, offset, length
 END_OF_STREAM = 0xFFFFFFFF
+PAUSE_MARK = 0xFFFFFFFE          # header only: offset 1 = the PC is paused (repeated every few seconds), 0 = resumed
 SPARE_SPACE = 64 * 1024 * 1024   # left free on the disk after a transfer
 PART = ".deckdrop-part"          # suffix of files still arriving
 HISTORY = 20
@@ -60,6 +65,112 @@ class Cancelled(Exception):
 
 class BadData(Exception):
     """The PC sent blocks that don't fit the files it offered."""
+
+
+class BlockReceiver(asyncio.BufferedProtocol):
+    """One connection of a parallel transfer, read straight into each block's own buffer.
+
+    asyncio's StreamReader copies every byte into its buffer and again out of it, which was most of the backend's CPU
+    time; here the kernel writes into the block buffer directly. Complete blocks queue up for the writer (reading
+    pauses when a few are waiting). Takes over a connection that was a StreamReader until now.
+    """
+    WAITING_MAX = 4
+
+    def __init__(self, reader, writer):
+        self.transport = writer.transport
+        self.blocks = collections.deque()
+        self.head = bytearray(BLOCK.size)
+        self.target, self.filled, self.block = self.head, 0, None
+        self.ended = None               # the exception next() raises once queued blocks run out
+        self.discarding = False
+        self.scratch = bytearray(256 * 1024)
+        self.paused = False
+        self.waiter = None
+        leftover = bytes(reader._buffer)            # whatever the StreamReader already holds
+        reader._buffer.clear()
+        self.transport.set_protocol(self)
+        if getattr(reader, "_paused", False):       # the StreamReader had paused reading; nothing would resume it
+            self.transport.resume_reading()
+        view = memoryview(leftover)
+        while view and not self.discarding:
+            buf = self.get_buffer(len(view))
+            k = min(len(buf), len(view))
+            buf[:k] = view[:k]
+            view = view[k:]
+            self.buffer_updated(k)
+        # Closed before the takeover: connection_lost already went to the StreamReader, so note it here.
+        if reader.exception() is not None:
+            self.ended = self.ended or reader.exception()
+        elif reader.at_eof() or self.transport.is_closing():
+            self.ended = self.ended or EOFError()
+
+    def get_buffer(self, sizehint):
+        if self.discarding:
+            return self.scratch
+        return memoryview(self.target)[self.filled:]
+
+    def buffer_updated(self, nbytes):
+        if self.discarding:
+            return
+        self.filled += nbytes
+        if self.filled < len(self.target):
+            return
+        if self.target is self.head:
+            idx, offset, length = BLOCK.unpack(self.head)
+            self.filled = 0
+            if idx in (END_OF_STREAM, PAUSE_MARK) or length == 0:
+                self._push((idx, offset, b""))
+            elif length > MAX_BLOCK:
+                self.stop(BadData("a block that's too big"))
+            else:
+                self.block, self.target = (idx, offset), bytearray(length)
+        else:
+            self._push((self.block[0], self.block[1], self.target))
+            self.target, self.filled = self.head, 0
+
+    def _push(self, item):
+        self.blocks.append(item)
+        if len(self.blocks) >= self.WAITING_MAX and not self.paused:
+            self.paused = True
+            self.transport.pause_reading()
+        self._wake()
+
+    def _wake(self):
+        if self.waiter is not None and not self.waiter.done():
+            self.waiter.set_result(None)
+
+    def eof_received(self):
+        self.ended = self.ended or EOFError()       # the PC closed it: cancelled there
+        self._wake()
+        return False
+
+    def connection_lost(self, exc):
+        self.ended = self.ended or exc or EOFError()
+        self._wake()
+
+    async def next(self, timeout):
+        """The next (index, offset, data); raises how the connection ended, or TimeoutError if nothing comes."""
+        while not self.blocks:
+            if self.ended is not None:
+                raise self.ended
+            self.waiter = asyncio.get_running_loop().create_future()
+            await asyncio.wait_for(self.waiter, timeout)
+        item = self.blocks.popleft()
+        if self.paused and len(self.blocks) <= self.WAITING_MAX // 2:
+            self.paused = False
+            self.transport.resume_reading()
+        return item
+
+    def stop(self, exc):
+        """Ends the transfer on this connection (next() raises exc); anything still arriving is read and dropped,
+        so the PC sees the Deck's message instead of a reset connection."""
+        self.ended = exc
+        self.discarding = True
+        self.blocks.clear()
+        if self.paused:
+            self.paused = False
+            self.transport.resume_reading()
+        self._wake()
 
 
 def write_at(f, data, offset):
@@ -572,14 +683,18 @@ class Plugin:
         names = plan_names(folder, files)
         t = {"id": offer["id"], "from": offer["from"], "count": offer["count"], "size": offer["size"],
              "received": 0, "index": 0, "current": "", "cancel": False, "started": time.monotonic(),
-             "saved": 0, "paths": [], "streams": 1}
+             "saved": 0, "paths": [], "streams": 1, "receivers": [], "control": writer,
+             "paused": False, "paused_by": "", "paused_since": 0.0, "paused_total": 0.0, "can_pause": False}
         requested = msg.get("streams")
         if isinstance(requested, int) and not isinstance(requested, bool) and requested > 1:
             t["streams"] = min(requested, MAX_STREAMS)
+            # Only PC apps that said so understand pause requests from the Deck.
+            t["can_pause"] = msg.get("pause") is True
             token = secrets.token_hex(16)
             self.stream_slots[token] = asyncio.Queue()
-            await self._reply(writer, {"ok": True, "accepted": True, "folder": folder, "streams": t["streams"], "token": token})
-            work = self._save_parallel(t, offer, files, names, reader, token)
+            await self._reply(writer, {"ok": True, "accepted": True, "folder": folder, "streams": t["streams"],
+                                       "token": token, "pause": True})
+            work = self._save_parallel(t, offer, files, names, reader, writer, token)
         else:                                    # an older PC app: one connection, files back to back
             await self._reply(writer, {"ok": True, "accepted": True, "folder": folder})
             work = self._save_sequential(t, offer, files, names, reader)
@@ -638,6 +753,24 @@ class Plugin:
                 pass
 
     @staticmethod
+    def _set_paused(t, paused, by):
+        if paused == t["paused"]:
+            return
+        now = time.monotonic()
+        if paused:
+            t["paused_since"], t["paused_by"] = now, by
+        else:
+            t["paused_total"] += now - t["paused_since"]
+            t["paused_by"] = ""
+        t["paused"] = paused
+
+    @staticmethod
+    def _active_time(t):
+        """Seconds the transfer has been running, not counting pauses (for speed and time left)."""
+        paused = t["paused_total"] + (time.monotonic() - t["paused_since"] if t["paused"] else 0)
+        return time.monotonic() - t["started"] - paused
+
+    @staticmethod
     def _file_saved(t, f):
         t["saved"] += 1
         if len(t["paths"]) < 5:
@@ -670,10 +803,11 @@ class Plugin:
                 raise
             self._file_saved(t, f)
 
-    async def _save_parallel(self, t, offer, files, names, reader, token):
+    async def _save_parallel(self, t, offer, files, names, reader, writer, token):
         queue = self.stream_slots[token]
         incoming, extra, tasks = {}, [], []
         run_io = lambda fn, *a: self.loop.run_in_executor(None, fn, *a)
+        t["receivers"] = [BlockReceiver(reader, writer)]
         try:
             for i, (_, size) in enumerate(files):          # empty files aren't sent
                 if size == 0:
@@ -682,9 +816,10 @@ class Plugin:
                     await run_io(self._write_whole, f, b"")
                     self._file_saved(t, f)
             for _ in range(t["streams"] - 1):
-                extra.append(await asyncio.wait_for(queue.get(), 15))
-            readers = [reader] + [r for r, _, _ in extra]
-            tasks = [self.loop.create_task(self._receive_blocks(t, offer, files, names, incoming, r)) for r in readers]
+                item = await asyncio.wait_for(queue.get(), 15)
+                extra.append(item)
+                t["receivers"].append(BlockReceiver(item[0], item[1]))
+            tasks = [self.loop.create_task(self._receive_blocks(t, offer, files, names, incoming, r)) for r in t["receivers"]]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
                 if task.exception() is not None:
@@ -694,6 +829,8 @@ class Plugin:
                 raise BadData("%d files didn't arrive completely" % missing)
         finally:
             self.stream_slots.pop(token, None)
+            for r in t["receivers"]:
+                r.stop(Cancelled())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -708,19 +845,22 @@ class Plugin:
                 if not f["saved"]:
                     await run_io(self._discard, f)
 
-    async def _receive_blocks(self, t, offer, files, names, incoming, reader):
-        """Reads blocks from one connection of a parallel transfer until its end marker."""
+    async def _receive_blocks(self, t, offer, files, names, incoming, receiver):
+        """Takes blocks from one connection of a parallel transfer until its end marker."""
         run_io = lambda fn, *a: self.loop.run_in_executor(None, fn, *a)
         while True:
             if t["cancel"]:
                 raise Cancelled()
-            head = await asyncio.wait_for(reader.readexactly(BLOCK.size), IDLE_TIMEOUT)
-            idx, offset, length = BLOCK.unpack(head)
+            # While paused, the PC repeats its pause mark every few seconds, so the usual timeout still applies.
+            idx, offset, data = await receiver.next(IDLE_TIMEOUT)
             if idx == END_OF_STREAM:
                 return
-            if idx >= len(files) or length == 0 or length > MAX_BLOCK or offset + length > files[idx][1]:
+            if idx == PAUSE_MARK:
+                self._set_paused(t, bool(offset), "pc")
+                continue
+            length = len(data)
+            if idx >= len(files) or offset + length > files[idx][1]:
                 raise BadData("a block that doesn't fit the files offered")
-            data = await asyncio.wait_for(reader.readexactly(length), IDLE_TIMEOUT)
             if t["cancel"]:
                 raise Cancelled()
             t["received"] += length
@@ -761,9 +901,12 @@ class Plugin:
                 await self._reply(writer, {"ok": False, "error": "cancelled on the Deck"})
                 writer.write_eof()
                 # Keep reading for a moment so the PC sees the message instead of a reset connection.
-                end = time.monotonic() + 3
-                while time.monotonic() < end and await asyncio.wait_for(reader.read(CHUNK), 3):
-                    pass
+                if t["receivers"]:
+                    await asyncio.sleep(1.5)               # the receivers are dropping what still arrives
+                else:
+                    end = time.monotonic() + 3
+                    while time.monotonic() < end and await asyncio.wait_for(reader.read(CHUNK), 3):
+                        pass
             except (OSError, asyncio.TimeoutError):
                 pass
         except EOFError:
@@ -822,7 +965,8 @@ class Plugin:
             "offers": [self._offer_view(o) for o in sorted(self.offers.values(), key=lambda o: o["id"])],
             "transfers": [{"id": t["id"], "from": t["from"], "count": t["count"], "size": t["size"],
                            "received": t["received"], "index": t["index"], "current": t["current"],
-                           "elapsed": now - t["started"], "cancelling": t["cancel"]} for t in self.transfers.values()],
+                           "elapsed": self._active_time(t), "cancelling": t["cancel"], "paused": t["paused"],
+                           "paused_by": t["paused_by"], "can_pause": t["can_pause"]} for t in self.transfers.values()],
             "history": list(reversed(self.history)),
             "settings": {k: self.settings[k] for k in DEFAULTS if k != "id"},
             "listening": self.server is not None,
@@ -841,6 +985,21 @@ class Plugin:
         if t is None:
             return False
         t["cancel"] = True
+        for r in t["receivers"]:                 # right away, even while paused and nothing arrives
+            r.stop(Cancelled())
+        return True
+
+    async def pause_transfer(self, transfer_id, paused):
+        """Asks the PC to pause or resume sending (only PC apps that support it)."""
+        t = self.transfers.get(transfer_id)
+        if t is None or not t["can_pause"] or t["cancel"]:
+            return False
+        try:
+            await self._reply(t["control"], {"type": "pause" if paused else "resume"})
+        except OSError:
+            return False
+        self._set_paused(t, bool(paused), "deck")
+        decky.logger.info("transfer %d %s on the Deck", t["id"], "paused" if paused else "resumed")
         return True
 
     async def clear_history(self):

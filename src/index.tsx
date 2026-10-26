@@ -19,7 +19,10 @@ import { FaFileDownload } from "react-icons/fa";
 
 type Peer = { id: string; name: string; kind: string; ip: string };
 type Offer = { id: number; from: string; count: number; size: number; names: string[]; folders: number; time: number; expires: number; folder: string };
-type Transfer = { id: number; from: string; count: number; size: number; received: number; index: number; current: string; elapsed: number; cancelling: boolean };
+type Transfer = {
+  id: number; from: string; count: number; size: number; received: number; index: number; current: string; elapsed: number;
+  cancelling: boolean; paused: boolean; paused_by: string; can_pause: boolean;
+};
 type Item = { id: number; from: string; count: number; size: number; saved: number; received: number; status: string; message: string; names: string[]; time: number };
 type Settings = { enabled: boolean; notify: boolean };
 type State = {
@@ -40,6 +43,7 @@ type Done = { id: number; from: string; status: string; message: string; saved: 
 const getState = callable<[], State>("get_state");
 const respondOffer = callable<[id: number, accept: boolean], boolean>("respond_offer");
 const cancelTransfer = callable<[id: number], boolean>("cancel_transfer");
+const pauseTransfer = callable<[id: number, paused: boolean], boolean>("pause_transfer");
 const clearHistory = callable<[], void>("clear_history");
 const setSetting = callable<[key: string, value: boolean], void>("set_setting");
 const setFolder = callable<[path: string], { ok: boolean; message: string }>("set_folder");
@@ -146,18 +150,30 @@ function TransferRow({ t }: { t: Transfer }) {
   const fraction = t.size > 0 ? t.received / t.size : 1;
   const speed = t.elapsed > 0.5 ? t.received / t.elapsed : 0;
   const left = speed > 0 ? (t.size - t.received) / speed : 0;
+  const operation = t.cancelling ? "Cancelling…"
+    : t.paused ? `Paused on ${t.paused_by === "deck" ? "this Deck" : "the PC"}`
+    : `File ${Math.min(t.index + 1, t.count)} of ${t.count}: ${t.current}`;
+  // The PC can always pause; pausing from here needs a PC app that understands it (1.2 or newer).
+  const canToggle = t.can_pause || (t.paused && t.paused_by === "deck");
   return (
     <>
       <PanelSectionRow>
         <ProgressBarWithInfo
           label={`From ${t.from}`}
           nProgress={fraction * 100}
-          sOperationText={t.cancelling ? "Cancelling…" : `File ${Math.min(t.index + 1, t.count)} of ${t.count}: ${t.current}`}
-          description={`${formatSize(t.received)} of ${formatSize(t.size)}${speed > 0 ? ` · ${formatSize(speed)}/s · ${formatDuration(left)} left` : ""}`}
+          sOperationText={operation}
+          description={`${formatSize(t.received)} of ${formatSize(t.size)}${speed > 0 && !t.paused ? ` · ${formatSize(speed)}/s · ${formatDuration(left)} left` : ""}`}
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={t.cancelling} onClick={() => cancelTransfer(t.id)}>Cancel</ButtonItem>
+        <Focusable style={{ display: "flex", gap: "8px" }} flow-children="horizontal">
+          {canToggle && (
+            <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={t.cancelling} onClick={() => pauseTransfer(t.id, !t.paused)}>
+              {t.paused ? "Resume" : "Pause"}
+            </DialogButton>
+          )}
+          <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={t.cancelling} onClick={() => cancelTransfer(t.id)}>Cancel</DialogButton>
+        </Focusable>
       </PanelSectionRow>
     </>
   );
