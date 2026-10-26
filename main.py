@@ -9,21 +9,29 @@
 #       PC   -> the files' bytes back to back, in offer order
 #       Deck <- {"ok": true, "done": true, "saved": n}\n
 #     While the bytes arrive the Deck may send {"ok": false, "error": "..."}\n (e.g. cancelled); the PC checks for it.
+#   - parallel transfer (v2): an offer with "streams": n gets "streams" and a "token" back with the acceptance. The PC
+#     then opens n-1 more connections, each starting with {"type": "data", "token": ...}\n, and every connection
+#     (the first one included) carries blocks: a 16-byte little-endian header (file index u32, offset u64, length u32)
+#     and that many bytes, in any order across connections, ending with a header whose index is 0xFFFFFFFF. Empty
+#     files are never sent; the Deck creates them. Several connections fill Wi-Fi better than one.
 
 import asyncio
 import collections
 import json
 import os
 import random
+import secrets
 import shutil
 import socket
+import struct
 import subprocess
+import threading
 import time
 
 import decky
 
 APP = "deckdrop"
-PROTOCOL = 1
+PROTOCOL = 2
 TCP_PORT = int(os.environ.get("DECKDROP_TCP_PORT", "47400"))       # overridable for tests on one machine
 UDP_PORT = int(os.environ.get("DECKDROP_UDP_PORT", "47401"))
 BIND = os.environ.get("DECKDROP_BIND", "0.0.0.0")                 # 127.0.0.1 for tests
@@ -36,6 +44,10 @@ IDLE_TIMEOUT = 30                # a transfer that receives nothing for this lon
 MAX_OFFER = 8 * 1024 * 1024      # longest offer line (the file list)
 MAX_FILES = 20000
 CHUNK = 1024 * 1024
+MAX_STREAMS = 4                  # parallel connections per transfer
+MAX_BLOCK = 8 * 1024 * 1024
+BLOCK = struct.Struct("<IQI")    # file index, offset, length
+END_OF_STREAM = 0xFFFFFFFF
 SPARE_SPACE = 64 * 1024 * 1024   # left free on the disk after a transfer
 PART = ".deckdrop-part"          # suffix of files still arriving
 HISTORY = 20
@@ -44,6 +56,24 @@ DEFAULTS = {"id": "", "enabled": True, "notify": True, "folder": ""}     # folde
 
 class Cancelled(Exception):
     pass
+
+
+class BadData(Exception):
+    """The PC sent blocks that don't fit the files it offered."""
+
+
+def write_at(f, data, offset):
+    """Writes data at offset in an incoming file (several connections fill one file at once)."""
+    if hasattr(os, "pwrite"):
+        fd = f["fh"].fileno()
+        view = memoryview(data)
+        while view:
+            n = os.pwrite(fd, view, offset)
+            view, offset = view[n:], offset + n
+    else:                                    # Windows (tests): no pwrite
+        with f["lock"]:
+            f["fh"].seek(offset)
+            f["fh"].write(data)
 
 
 def system_env():
@@ -256,6 +286,7 @@ class Plugin:
         self.peers = {}
         self.offers = {}             # waiting for an answer: id -> offer
         self.transfers = {}          # accepted and arriving: id -> transfer
+        self.stream_slots = {}       # parallel transfer token -> queue of its extra connections
         self.history = collections.deque(maxlen=HISTORY)
         self.next_id = 1
         self.status, self.status_error = "", False
@@ -462,6 +493,13 @@ class Plugin:
                 await self._reply(writer, {"ok": True, "id": self.settings["id"], "name": self.name, "kind": "deck"})
             elif msg.get("type") == "offer":
                 await self._receive(msg, ip, reader, writer)
+            elif msg.get("type") == "data":
+                # An extra connection of a parallel transfer: hand it over, keep it open until the transfer is over.
+                queue = self.stream_slots.get(str(msg.get("token") or ""))
+                if queue is not None:
+                    finished = self.loop.create_future()
+                    await queue.put((reader, writer, finished))
+                    await finished
             else:
                 await self._reply(writer, {"ok": False, "error": "unknown request"})
         except (OSError, asyncio.IncompleteReadError):
@@ -532,54 +570,190 @@ class Plugin:
             return
 
         names = plan_names(folder, files)
-        await self._reply(writer, {"ok": True, "accepted": True, "folder": folder})
-        await self._save(offer, files, names, reader, writer)
-
-    async def _save(self, offer, files, names, reader, writer):
         t = {"id": offer["id"], "from": offer["from"], "count": offer["count"], "size": offer["size"],
-             "received": 0, "index": 0, "current": "", "cancel": False, "started": time.monotonic()}
-        self.transfers[t["id"]] = t
-        saved, status, message, paths = 0, "done", "", []
-        run_io = lambda f, *a: self.loop.run_in_executor(None, f, *a)
+             "received": 0, "index": 0, "current": "", "cancel": False, "started": time.monotonic(),
+             "saved": 0, "paths": [], "streams": 1}
+        requested = msg.get("streams")
+        if isinstance(requested, int) and not isinstance(requested, bool) and requested > 1:
+            t["streams"] = min(requested, MAX_STREAMS)
+            token = secrets.token_hex(16)
+            self.stream_slots[token] = asyncio.Queue()
+            await self._reply(writer, {"ok": True, "accepted": True, "folder": folder, "streams": t["streams"], "token": token})
+            work = self._save_parallel(t, offer, files, names, reader, token)
+        else:                                    # an older PC app: one connection, files back to back
+            await self._reply(writer, {"ok": True, "accepted": True, "folder": folder})
+            work = self._save_sequential(t, offer, files, names, reader)
+        await self._run_transfer(t, offer, files, work, reader, writer)
+
+    # ---------- saving
+
+    def _incoming(self, offer, names, files, incoming, idx):
+        """State of one file being received: where it goes, how much has arrived."""
+        parts, size = files[idx]
+        rel = [names[parts[0]]] + parts[1:]
+        target = os.path.join(offer["folder"], *rel)
+        f = {"rel": "/".join(rel), "target": target, "part": target + PART, "size": size, "received": 0,
+             "fh": None, "ready": None, "closing": False, "saved": False, "lock": threading.Lock()}
+        incoming[idx] = f
+        return f
+
+    def _open_part(self, f):
+        self._makedirs(os.path.dirname(f["target"]))
+        f["fh"] = open(f["part"], "wb", buffering=0)
+
+    def _rename_part(self, f):
+        """name.deckdrop-part -> name, without overwriting anything that appeared meanwhile."""
+        target = f["target"]
+        if os.path.lexists(target):
+            d, base = os.path.split(target)
+            target = os.path.join(d, free_name(d, base, False, set()))
+        os.rename(f["part"], target)
+        self._chown(target)
+        f["target"], f["saved"] = target, True
+
+    def _write_whole(self, f, data):
+        """A file that arrived in one piece (small files): created, written and renamed in one go."""
+        self._makedirs(os.path.dirname(f["target"]))
+        with open(f["part"], "wb") as fh:
+            fh.write(data)
+        self._rename_part(f)
+
+    def _close_and_rename(self, f):
+        fh, f["fh"] = f["fh"], None
+        fh.close()
+        self._rename_part(f)
+
+    def _discard(self, f):
+        """Removes what arrived of a file that won't be completed."""
+        fh, f["fh"] = f["fh"], None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if not f["saved"]:
+            try:
+                os.remove(f["part"])
+            except OSError:
+                pass
+
+    @staticmethod
+    def _file_saved(t, f):
+        t["saved"] += 1
+        if len(t["paths"]) < 5:
+            t["paths"].append(f["target"])
+
+    async def _save_sequential(self, t, offer, files, names, reader):
+        incoming = {}
+        run_io = lambda fn, *a: self.loop.run_in_executor(None, fn, *a)
+        for i in range(len(files)):
+            f = self._incoming(offer, names, files, incoming, i)
+            t["index"], t["current"] = i, f["rel"]
+            await run_io(self._open_part, f)
+            try:
+                remaining = f["size"]
+                while remaining:
+                    buf = bytearray()
+                    while remaining and len(buf) < CHUNK:
+                        if t["cancel"]:
+                            raise Cancelled()
+                        data = await asyncio.wait_for(reader.read(min(remaining, CHUNK - len(buf))), IDLE_TIMEOUT)
+                        if not data:
+                            raise EOFError()          # the PC closed the connection: cancelled there
+                        buf += data
+                        remaining -= len(data)
+                        t["received"] += len(data)
+                    await run_io(f["fh"].write, buf)
+                await run_io(self._close_and_rename, f)
+            except BaseException:
+                await run_io(self._discard, f)
+                raise
+            self._file_saved(t, f)
+
+    async def _save_parallel(self, t, offer, files, names, reader, token):
+        queue = self.stream_slots[token]
+        incoming, extra, tasks = {}, [], []
+        run_io = lambda fn, *a: self.loop.run_in_executor(None, fn, *a)
         try:
-            for i, (parts, size) in enumerate(files):
-                rel = [names[parts[0]]] + parts[1:]
-                target = os.path.join(offer["folder"], *rel)
-                t["index"], t["current"] = i, "/".join(rel)
-                await run_io(self._makedirs, os.path.dirname(target))
-                part = target + PART
-                fh = await run_io(open, part, "wb")
-                try:
-                    remaining = size
-                    while remaining:
-                        buf = bytearray()
-                        while remaining and len(buf) < CHUNK:
-                            if t["cancel"]:
-                                raise Cancelled()
-                            data = await asyncio.wait_for(reader.read(min(remaining, CHUNK - len(buf))), IDLE_TIMEOUT)
-                            if not data:
-                                raise EOFError()          # the PC closed the connection: cancelled there
-                            buf += data
-                            remaining -= len(data)
-                            t["received"] += len(data)
-                        await run_io(fh.write, buf)
-                    await run_io(fh.close)
-                except BaseException:
-                    await run_io(fh.close)
-                    try:
-                        os.remove(part)
-                    except OSError:
-                        pass
-                    raise
-                if os.path.lexists(target):           # appeared while this file was arriving: don't overwrite it
-                    d, base = os.path.split(target)
-                    target = os.path.join(d, free_name(d, base, False, set()))
-                os.rename(part, target)
-                self._chown(target)
-                saved += 1
-                if len(paths) < 5:
-                    paths.append(target)
-            await self._reply(writer, {"ok": True, "done": True, "saved": saved})
+            for i, (_, size) in enumerate(files):          # empty files aren't sent
+                if size == 0:
+                    f = self._incoming(offer, names, files, incoming, i)
+                    f["closing"] = True
+                    await run_io(self._write_whole, f, b"")
+                    self._file_saved(t, f)
+            for _ in range(t["streams"] - 1):
+                extra.append(await asyncio.wait_for(queue.get(), 15))
+            readers = [reader] + [r for r, _, _ in extra]
+            tasks = [self.loop.create_task(self._receive_blocks(t, offer, files, names, incoming, r)) for r in readers]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                if task.exception() is not None:
+                    raise task.exception()
+            missing = sum(1 for f in incoming.values() if not f["saved"]) + len(files) - len(incoming)
+            if missing:
+                raise BadData("%d files didn't arrive completely" % missing)
+        finally:
+            self.stream_slots.pop(token, None)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            while not queue.empty():                       # connections that came too late
+                extra.append(queue.get_nowait())
+            for _, _, finished in extra:                   # lets their handlers close them
+                if not finished.done():
+                    finished.set_result(None)
+            pending_io = [f["ready"] for f in incoming.values() if f["ready"] is not None]
+            await asyncio.gather(*pending_io, return_exceptions=True)
+            for f in incoming.values():
+                if not f["saved"]:
+                    await run_io(self._discard, f)
+
+    async def _receive_blocks(self, t, offer, files, names, incoming, reader):
+        """Reads blocks from one connection of a parallel transfer until its end marker."""
+        run_io = lambda fn, *a: self.loop.run_in_executor(None, fn, *a)
+        while True:
+            if t["cancel"]:
+                raise Cancelled()
+            head = await asyncio.wait_for(reader.readexactly(BLOCK.size), IDLE_TIMEOUT)
+            idx, offset, length = BLOCK.unpack(head)
+            if idx == END_OF_STREAM:
+                return
+            if idx >= len(files) or length == 0 or length > MAX_BLOCK or offset + length > files[idx][1]:
+                raise BadData("a block that doesn't fit the files offered")
+            data = await asyncio.wait_for(reader.readexactly(length), IDLE_TIMEOUT)
+            if t["cancel"]:
+                raise Cancelled()
+            t["received"] += length
+            f = incoming.get(idx)
+            if f is None:
+                f = self._incoming(offer, names, files, incoming, idx)
+                t["index"], t["current"] = max(t["index"], idx), f["rel"]
+                if length == f["size"]:                    # the whole file in one block: one trip to the thread pool
+                    f["closing"] = True
+                    f["ready"] = run_io(self._write_whole, f, data)
+                    await f["ready"]
+                    self._file_saved(t, f)
+                    continue
+                f["ready"] = run_io(self._open_part, f)      # a future other blocks of this file wait on too
+            if f["closing"]:
+                raise BadData("more data for a file that was already complete")
+            await f["ready"]
+            await run_io(write_at, f, data, offset)
+            f["received"] += length
+            if f["received"] > f["size"]:
+                raise BadData("more data than the file's size")
+            if f["received"] == f["size"]:
+                f["closing"] = True
+                await run_io(self._close_and_rename, f)
+                self._file_saved(t, f)
+
+    async def _run_transfer(self, t, offer, files, work, reader, writer):
+        """Runs an accepted transfer and reports how it ended (to the PC, the log, the list and a notification)."""
+        self.transfers[t["id"]] = t
+        status, message = "done", ""
+        try:
+            await work
+            await self._reply(writer, {"ok": True, "done": True, "saved": t["saved"]})
             message = "Saved to " + offer["folder"]
         except Cancelled:
             status, message = "cancelled", "Cancelled on the Deck"
@@ -596,7 +770,13 @@ class Plugin:
             status, message = "cancelled", "Cancelled on the PC"
         except asyncio.TimeoutError:
             status, message = "failed", "The PC stopped sending"
-        except (ConnectionError, asyncio.IncompleteReadError):
+        except BadData as e:
+            status, message = "failed", "The PC sent something unexpected (%s)" % e
+            try:
+                await self._reply(writer, {"ok": False, "error": "the Deck stopped the transfer: %s" % e})
+            except OSError:
+                pass
+        except ConnectionError:
             status, message = "failed", "The connection to the PC was lost"
         except OSError as e:
             status, message = "failed", "Couldn't save: %s" % (e.strerror or e)
@@ -604,9 +784,19 @@ class Plugin:
                 await self._reply(writer, {"ok": False, "error": "the Deck couldn't save the files (%s)" % (e.strerror or e)})
             except OSError:
                 pass
+        except Exception as e:                   # a bug: still report it instead of leaving the PC hanging
+            decky.logger.exception("transfer %d failed", t["id"])
+            status, message = "failed", "Something went wrong on the Deck (%s)" % e
+            try:
+                await self._reply(writer, {"ok": False, "error": "something went wrong on the Deck (%s)" % e})
+            except OSError:
+                pass
         finally:
             self.transfers.pop(t["id"], None)
-        decky.logger.info("transfer %d: %s, %d of %d files saved (%s)%s", t["id"], status, saved, len(files), message,
+        saved, paths = t["saved"], t["paths"]
+        secs = time.monotonic() - t["started"]
+        decky.logger.info("transfer %d: %s, %d of %d files saved, %s in %.1f s over %d connection(s) (%s)%s", t["id"], status,
+                          saved, len(files), format_size(t["received"]), secs, t["streams"], message,
                           "".join("\n    " + p for p in paths) + ("\n    ..." if saved > len(paths) else ""))
         self._record(offer, status, message, saved, t["received"])
         await self._emit("deckdrop_done", {"id": t["id"], "from": t["from"], "status": status, "message": message,

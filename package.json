@@ -1,6 +1,6 @@
 {
   "name": "deckdrop",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Receive files from a Windows PC on the Steam Deck, with approval",
   "type": "module",
   "scripts": {
